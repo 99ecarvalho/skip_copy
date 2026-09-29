@@ -1,45 +1,45 @@
 #!/usr/bin/env python3
 """
-skip_copy.py - copia arquivos de ORIGEM para DESTINO, pulando rapidamente
-arquivos que dao erro de I/O (CRC em midia ruim) e registrando-os.
+skip_copy.py - copies files from SOURCE to DESTINATION, quickly skipping
+files that raise I/O errors (CRC errors on bad media) and logging them.
 
-Logs (caminhos absolutos da origem; compartilhaveis entre execucoes):
-- --log              FALHAS:        <abs_path>\\t# <motivo> (<dt>s)
-- --done-log         SUCESSOS:      <abs_path>
-- --checkpoint-log   DIRETORIOS OK: <abs_dir_path> (subarvore 100% copiada
-                     sem falhas, sera pulada inteira na proxima execucao)
-- --accept-loss      PERDAS ACEITAS (entrada): caminhos absolutos -- arquivos
-                     OU diretorios -- que voce assume como perdiveis. Falhas
-                     dentro deles nao impedem que diretorios pais virem
-                     checkpoint. Default: /root/accept_loss.txt
+Logs (absolute source paths; can be shared across runs):
+- --log              FAILURES:      <abs_path>\\t# <reason> (<dt>s)
+- --done-log         SUCCESSES:     <abs_path>
+- --checkpoint-log   DIRS OK:       <abs_dir_path> (subtree 100% copied
+                     without failures; skipped entirely on the next run)
+- --accept-loss      ACCEPTED LOSSES (input): absolute paths -- files
+                     OR directories -- that you accept losing. Failures
+                     inside them do not prevent parent directories from
+                     being checkpointed. Default: /root/accept_loss.txt
 
-Legenda do progresso (stdout):
-    .   copiou agora
-    :   pulado pelo done-log (ja copiou em rodada anterior)
-    =   destino ja existia com mesmo tamanho (--check-size)
-    D   subarvore inteira pulada por checkpoint
-    L   pulado por --accept-loss (perda aceita)
-    x   pulado pelo err-log (--skip-failed)
-    X   falha nesta rodada (foi pro err-log)
+Progress legend (stdout):
+    .   copied now
+    :   skipped via done-log (already copied in a previous run)
+    =   destination already existed with the same size (--check-size)
+    D   entire subtree skipped via checkpoint
+    L   skipped via --accept-loss (accepted loss)
+    x   skipped via err-log (--skip-failed)
+    X   failed in this run (written to err-log)
 
-Estrategia para midia ruim:
-- Enumeracao via os.scandir SEM stat por arquivo (usa d_type), e ainda
-  por cima dentro de um subprocesso com timeout (--scan-timeout) para
-  diretorios em area defeituosa que travam a listagem no kernel.
-- Copia em processo filho monitorado pelo pai:
-    * --stall N   : aborta se o destino nao crescer por N segundos.
-    * --timeout N : teto absoluto opcional por arquivo.
-    * sem retry.
-- Kill do filho preso e NAO-BLOQUEANTE (caso o kernel deixe o processo
-  em D-state por hardware travado). O parent move adiante e o filho
-  vira orfao/zumbi -- o resto da copia continua.
-- Status file (--status-file, default /tmp/skip_copy.status em tmpfs):
-  grava o que esta sendo feito agora; em caso de travamento, basta
-  'cat' do arquivo para descobrir onde parou.
+Strategy for bad media:
+- Enumeration via os.scandir WITHOUT a per-file stat (uses d_type), and
+  on top of that inside a subprocess with a timeout (--scan-timeout) for
+  directories in damaged areas that hang the listing in the kernel.
+- Copying happens in a child process monitored by the parent:
+    * --stall N   : abort if the destination does not grow for N seconds.
+    * --timeout N : optional absolute cap per file.
+    * no retry.
+- Killing a stuck child is NON-BLOCKING (in case the kernel leaves the
+  process in D-state due to hung hardware). The parent moves on and the
+  child becomes an orphan/zombie -- the rest of the copy continues.
+- Status file (--status-file, default /tmp/skip_copy.status on tmpfs):
+  records what is being done right now; if things hang, just 'cat' the
+  file to find out where it stopped.
 
 Ctrl+C:
-- 1x  -> aborta o arquivo atual e segue.
-- 2x rapido (<2s) -> sai do programa.
+- 1x  -> abort the current file and continue.
+- 2x quickly (<2s) -> exit the program.
 """
 
 from __future__ import annotations
@@ -56,11 +56,11 @@ from datetime import datetime
 
 
 # ---------------------------------------------------------------------------
-# estado global para sinais
+# global state for signal handling
 # ---------------------------------------------------------------------------
 
 class _Ctrl:
-    abort_current = False   # sinaliza copy_one a desistir do arquivo atual
+    abort_current = False   # tells copy_one to give up on the current file
     last_int = 0.0
     int_count = 0
 
@@ -76,21 +76,21 @@ def _install_sigint() -> None:
             CTRL.int_count = 1
         CTRL.last_int = now
         if CTRL.int_count >= 2:
-            sys.stderr.write("\n[interrupt] segundo Ctrl+C, saindo HARD.\n")
+            sys.stderr.write("\n[interrupt] second Ctrl+C, exiting HARD.\n")
             os._exit(130)
         sys.stderr.write(
-            "\n[interrupt] pulando arquivo atual "
-            "(Ctrl+C de novo em <2s para sair).\n")
+            "\n[interrupt] skipping current file "
+            "(Ctrl+C again within 2s to exit).\n")
         CTRL.abort_current = True
     signal.signal(signal.SIGINT, handler)
 
 
 # ---------------------------------------------------------------------------
-# worker de copia
+# copy worker
 # ---------------------------------------------------------------------------
 
 def _copy_worker(src: str, dst: str, chunk: int, preserve: bool) -> None:
-    """Filho: sai 0 em sucesso, !=0 em falha. Sem retry."""
+    """Child: exits 0 on success, !=0 on failure. No retry."""
     signal.signal(signal.SIGTERM, lambda *_: os._exit(2))
     signal.signal(signal.SIGINT, lambda *_: os._exit(2))
     try:
@@ -126,15 +126,15 @@ def _copy_worker(src: str, dst: str, chunk: int, preserve: bool) -> None:
 
 
 def _kill_nb(p: mp.Process) -> None:
-    """Mata o filho sem bloquear. Se ele estiver preso em D-state no kernel,
-    nem SIGKILL fara nada -- entao a gente NAO espera. O resto da execucao
-    continua e o filho vira orfao/zumbi."""
+    """Kill the child without blocking. If it is stuck in D-state in the kernel,
+    not even SIGKILL will do anything -- so we do NOT wait. The rest of the
+    run continues and the child becomes an orphan/zombie."""
     try:
         if p.is_alive():
             p.terminate()
     except Exception:
         pass
-    # Da uma chance bem curta para sair com SIGTERM.
+    # Give it a very short chance to exit on SIGTERM.
     try:
         p.join(0.5)
     except Exception:
@@ -148,12 +148,12 @@ def _kill_nb(p: mp.Process) -> None:
         p.join(0.5)
     except Exception:
         pass
-    # Se ainda esta vivo, abandonamos. Nao chamamos join() sem timeout.
+    # If it is still alive, abandon it. Never call join() without a timeout.
 
 
 def copy_one(src: str, dst: str, stall: float, max_timeout: float,
              chunk: int, preserve: bool, poll: float = 1.0) -> tuple:
-    """Copia 1 arquivo num filho monitorado. Retorna (ok, motivo)."""
+    """Copy one file in a monitored child. Returns (ok, reason)."""
     ctx = mp.get_context("fork")
     p = ctx.Process(target=_copy_worker, args=(src, dst, chunk, preserve))
     p.start()
@@ -163,7 +163,7 @@ def copy_one(src: str, dst: str, stall: float, max_timeout: float,
     last_progress = start
 
     while True:
-        # Ctrl+C pelo usuario?
+        # Ctrl+C from the user?
         if CTRL.abort_current:
             CTRL.abort_current = False
             _kill_nb(p)
@@ -173,7 +173,7 @@ def copy_one(src: str, dst: str, stall: float, max_timeout: float,
         try:
             p.join(poll)
         except KeyboardInterrupt:
-            # nosso handler ja setou abort_current, repete o loop
+            # our handler already set abort_current; loop again
             continue
 
         now = time.monotonic()
@@ -214,13 +214,13 @@ def _safe_unlink(path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# scandir tolerante a midia ruim (em subprocesso, com timeout)
+# bad-media-tolerant scandir (in a subprocess, with a timeout)
 # ---------------------------------------------------------------------------
 #
-# scandir() pode travar no kernel quando o diretorio esta numa area com
-# defeito do disco. Isso bloqueia o processo PAI inteiro -- nem Ctrl+C
-# funciona porque o syscall fica em D-state. Por isso fazemos scandir
-# num filho monitorado e abandonamos o filho se ele exceder o timeout.
+# scandir() can hang in the kernel when the directory lives in a damaged
+# area of the disk. That blocks the entire PARENT process -- not even Ctrl+C
+# works because the syscall is stuck in D-state. That is why we run scandir
+# in a monitored child and abandon the child if it exceeds the timeout.
 
 def _scan_worker(d: str, q) -> None:
     signal.signal(signal.SIGTERM, lambda *_: os._exit(2))
@@ -229,7 +229,7 @@ def _scan_worker(d: str, q) -> None:
         result = []
         with os.scandir(d) as it:
             for e in it:
-                # classifica usando d_type (sem stat extra)
+                # classify using d_type (no extra stat)
                 try:
                     if e.is_symlink():
                         kind = "skip"
@@ -251,8 +251,8 @@ def _scan_worker(d: str, q) -> None:
 
 
 def safe_scandir(d: str, timeout: float):
-    """Lista entradas de `d` num subprocesso. Retorna (entries, error)
-    onde entries e uma lista de (name, kind) ou None em caso de erro."""
+    """List the entries of `d` in a subprocess. Returns (entries, error)
+    where entries is a list of (name, kind), or None on error."""
     ctx = mp.get_context("fork")
     q = ctx.Queue()
     p = ctx.Process(target=_scan_worker, args=(d, q))
@@ -288,17 +288,17 @@ def load_path_set(path: str) -> set:
                 if p:
                     s.add(p)
     except OSError as e:
-        print(f"aviso: nao consegui ler {path}: {e}", file=sys.stderr)
+        print(f"warning: could not read {path}: {e}", file=sys.stderr)
     return s
 
 
 class AcceptLoss:
-    """Conjunto de caminhos absolutos cujas falhas o usuario aceita perder.
-    Cada entrada pode ser um arquivo (match exato) ou um diretorio (match
-    no proprio diretorio e em qualquer descendente)."""
+    """Set of absolute paths whose failures the user accepts losing.
+    Each entry can be a file (exact match) or a directory (matches the
+    directory itself and any descendant)."""
 
     def __init__(self, paths: set):
-        # normaliza removendo barra final, exceto na raiz '/'
+        # normalize by stripping the trailing slash, except for root '/'
         norm = set()
         for p in paths:
             if not p:
@@ -314,13 +314,13 @@ class AcceptLoss:
         return len(self._paths)
 
     def covers(self, path: str) -> bool:
-        """True se `path` (ou algum ancestral) esta na lista."""
+        """True if `path` (or any ancestor) is in the list."""
         if not self._paths:
             return False
         p = path.rstrip("/") or "/"
         if p in self._paths:
             return True
-        # checa ancestrais
+        # check ancestors
         while True:
             parent = os.path.dirname(p)
             if parent == p:
@@ -331,7 +331,7 @@ class AcceptLoss:
 
 
 # ---------------------------------------------------------------------------
-# walk recursivo com checkpoint por diretorio
+# recursive walk with per-directory checkpoint
 # ---------------------------------------------------------------------------
 
 class WalkContext:
@@ -347,8 +347,8 @@ class WalkContext:
         self.err_log = err_log
         self.done_log = done_log
         self.ckpt_log = ckpt_log
-        self.status = status  # StatusFile ou None
-        # contadores
+        self.status = status  # StatusFile or None
+        # counters
         self.total = 0
         self.ok = 0
         self.fail = 0
@@ -357,7 +357,7 @@ class WalkContext:
         self.skipped_size = 0
         self.skipped_ckpt_dirs = 0
         self.skipped_accept = 0
-        # progresso
+        # progress
         self.total_planned = 0
         self.progress_step = 0
         self.next_progress = 0
@@ -365,8 +365,8 @@ class WalkContext:
 
 
 class StatusFile:
-    """Escreve a operacao atual num arquivo. Em caso de travamento, basta
-    'cat' do arquivo para descobrir onde o script estava preso."""
+    """Writes the current operation to a file. If things hang, just 'cat'
+    the file to find out where the script got stuck."""
     def __init__(self, path: str):
         self.path = path
         self.f = open(path, "w", buffering=1)
@@ -377,9 +377,9 @@ class StatusFile:
             self.f.truncate()
             self.f.write(f"{datetime.now().isoformat(timespec='seconds')}\t{phase}\t{path}\n")
             self.f.flush()
-            # NAO chamamos fsync de proposito: o default e /tmp (tmpfs/RAM),
-            # e mesmo em disco real fsync por arquivo desgastaria o SSD
-            # sem nenhum beneficio (o status e descartavel).
+            # We deliberately do NOT fsync: the default is /tmp (tmpfs/RAM),
+            # and even on a real disk a per-file fsync would wear out the SSD
+            # for no benefit (the status is disposable).
         except OSError:
             pass
 
@@ -415,17 +415,17 @@ def _print_progress(ctx: WalkContext, force: bool = False) -> None:
 
 
 def _process_file(full: str, ctx: WalkContext) -> bool:
-    """Retorna True se o diretorio pai pode considerar este arquivo OK
-    para fins de checkpoint (sucesso, skip por sucesso anterior, ou perda
-    aceita via --accept-loss). Retorna False se houve falha que impede o
-    checkpoint do pai.
+    """Returns True if the parent directory may consider this file OK
+    for checkpoint purposes (success, skipped due to a previous success, or
+    accepted loss via --accept-loss). Returns False if there was a failure
+    that prevents the parent from being checkpointed.
     """
     args = ctx.args
     ctx.total += 1
     rel = os.path.relpath(full, ctx.src_root)
     out = os.path.join(ctx.dst_root, rel)
 
-    # 0) perda aceita: nao tenta copiar, nao bloqueia checkpoint
+    # 0) accepted loss: do not try to copy, do not block the checkpoint
     if ctx.accept_loss.covers(full):
         ctx.skipped_accept += 1
         sys.stdout.write("L"); sys.stdout.flush()
@@ -435,7 +435,7 @@ def _process_file(full: str, ctx: WalkContext) -> bool:
     if ctx.status:
         ctx.status.set("file:check", full)
 
-    # 1) ja em done-log
+    # 1) already in done-log
     if full in ctx.done:
         if args.check_size:
             try:
@@ -454,12 +454,12 @@ def _process_file(full: str, ctx: WalkContext) -> bool:
             _print_progress(ctx)
             return True
 
-    # 2) ja em err-log e --skip-failed
+    # 2) already in err-log and --skip-failed
     if args.skip_failed and full in ctx.failed:
         ctx.skipped_fail += 1
         sys.stdout.write("x"); sys.stdout.flush()
         _print_progress(ctx)
-        # se esta sob area de perda aceita, nao bloqueia checkpoint do pai
+        # if under an accepted-loss area, do not block the parent's checkpoint
         return ctx.accept_loss.covers(full)
 
     if args.dry_run:
@@ -475,7 +475,7 @@ def _process_file(full: str, ctx: WalkContext) -> bool:
         _print_progress(ctx)
         return False
 
-    # 3) destino ja existe com mesmo tamanho? (so com --check-size)
+    # 3) destination already exists with the same size? (only with --check-size)
     if args.check_size:
         try:
             d_sz = os.path.getsize(out)
@@ -491,7 +491,7 @@ def _process_file(full: str, ctx: WalkContext) -> bool:
         except OSError:
             pass
 
-    # 4) copia
+    # 4) copy
     if ctx.status:
         ctx.status.set("file:copy", full)
     t0 = time.monotonic()
@@ -510,24 +510,24 @@ def _process_file(full: str, ctx: WalkContext) -> bool:
         ctx.err_log.write(f"{full}\t# {reason} ({dt:.1f}s)\n")
         sys.stdout.write("X"); sys.stdout.flush()
         _print_progress(ctx)
-        # se a falha esta dentro de uma area de perdas aceitas, nao
-        # bloqueia o checkpoint do diretorio pai
+        # if the failure is inside an accepted-loss area, do not
+        # block the parent directory's checkpoint
         return ctx.accept_loss.covers(full)
 
 
 def _process_dir(d: str, ctx: WalkContext) -> bool:
-    """Processa um diretorio recursivamente. Retorna True se a subarvore
-    inteira foi 100% copiada/considerada OK -- nesse caso o diretorio e
-    gravado no checkpoint."""
+    """Process a directory recursively. Returns True if the entire subtree
+    was 100% copied/considered OK -- in that case the directory is
+    written to the checkpoint."""
     args = ctx.args
 
-    # checkpoint: subarvore ja marcada como completa
+    # checkpoint: subtree already marked as complete
     if not args.no_checkpoint and d in ctx.checkpoint:
         ctx.skipped_ckpt_dirs += 1
         sys.stdout.write("D"); sys.stdout.flush()
         return True
 
-    # diretorio inteiro listado em --accept-loss: nao varre, considera OK
+    # whole directory listed in --accept-loss: do not scan, consider it OK
     if ctx.accept_loss.covers(d):
         ctx.skipped_accept += 1
         sys.stdout.write("L"); sys.stdout.flush()
@@ -541,14 +541,14 @@ def _process_dir(d: str, ctx: WalkContext) -> bool:
         sys.stderr.write(f"\n[scandir-fail] {d}: {scan_err}\n")
         if ctx.err_log:
             ctx.err_log.write(f"{d}\t# {scan_err}\n")
-        # se este diretorio esta sob area de perda aceita, nao bloqueia pai
+        # if this directory is under an accepted-loss area, do not block the parent
         return ctx.accept_loss.covers(d)
 
     all_good = True
     for name, kind in entries:
         full = os.path.join(d, name)
         if kind == "unknown":
-            sys.stderr.write(f"\n[type-unknown] {full} -- pulando\n")
+            sys.stderr.write(f"\n[type-unknown] {full} -- skipping\n")
             if ctx.err_log:
                 ctx.err_log.write(f"{full}\t# type-unknown\n")
             all_good = False
@@ -572,8 +572,8 @@ def _process_dir(d: str, ctx: WalkContext) -> bool:
 
 def _prescan(src_root: str, checkpoint: set, no_checkpoint: bool,
              scan_timeout: float, status, accept_loss: "AcceptLoss") -> int:
-    """Conta arquivos sob src_root, pulando subarvores em checkpoint
-    e em accept-loss. Usa safe_scandir para nao travar em diretorios ruins."""
+    """Count files under src_root, skipping subtrees that are checkpointed
+    or in accept-loss. Uses safe_scandir to avoid hanging on bad directories."""
     count = 0
     stack = [src_root]
     while stack:
@@ -597,7 +597,7 @@ def _prescan(src_root: str, checkpoint: set, no_checkpoint: bool,
             elif kind == "file":
                 count += 1
                 if count % 5000 == 0:
-                    print(f"[prescan] {count} arquivos...", flush=True)
+                    print(f"[prescan] {count} files...", flush=True)
     return count
 
 
@@ -607,65 +607,65 @@ def _prescan(src_root: str, checkpoint: set, no_checkpoint: bool,
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Copia pulando arquivos com erro de I/O (CRC) em midia ruim.")
-    ap.add_argument("src", help="diretorio de origem")
-    ap.add_argument("dst", help="diretorio de destino")
+        description="Copy files, skipping those with I/O (CRC) errors on bad media.")
+    ap.add_argument("src", help="source directory")
+    ap.add_argument("dst", help="destination directory")
     ap.add_argument("--log", default="/root/skip_copy.err.log",
-                    help="log de FALHAS (caminhos absolutos)")
+                    help="log of FAILURES (absolute paths)")
     ap.add_argument("--done-log", default="/root/skip_copy.done.log",
-                    help="log de SUCESSOS (caminhos absolutos)")
+                    help="log of SUCCESSES (absolute paths)")
     ap.add_argument("--checkpoint-log", default="/root/skip_copy.dirs.log",
-                    help="log de DIRETORIOS 100%% copiados (subarvore "
-                         "inteira pulada na proxima execucao)")
+                    help="log of 100%% copied DIRECTORIES (entire subtree "
+                         "skipped on the next run)")
     ap.add_argument("--accept-loss", default="/root/accept_loss.txt",
-                    help="arquivo de entrada com caminhos absolutos (arquivos "
-                         "OU diretorios) cuja perda voce aceita. Falhas dentro "
-                         "deles nao impedem que pais virem checkpoint. "
-                         "Use '' para desligar. Linhas com # sao comentarios.")
+                    help="input file with absolute paths (files "
+                         "OR directories) whose loss you accept. Failures inside "
+                         "them do not prevent parents from being checkpointed. "
+                         "Use '' to disable. Lines starting with # are comments.")
     ap.add_argument("--no-checkpoint", action="store_true",
-                    help="desliga o checkpoint por diretorio "
-                         "(re-visita toda a arvore)")
+                    help="disable the per-directory checkpoint "
+                         "(revisits the whole tree)")
     ap.add_argument("--skip-failed", action="store_true",
-                    help="pula arquivos que ja estao no log de falhas "
-                         "(util pra nao re-tentar areas danificadas; "
-                         "diretorios com falhas anteriores nao viram checkpoint "
-                         "a menos que voce passe --skip-failed)")
+                    help="skip files already in the failure log "
+                         "(useful to avoid retrying damaged areas; "
+                         "directories with previous failures are not checkpointed "
+                         "unless you pass --skip-failed)")
     ap.add_argument("--stall", type=float, default=15.0,
-                    help="aborta se destino nao crescer por N segundos (default 15)")
+                    help="abort if the destination does not grow for N seconds (default 15)")
     ap.add_argument("--timeout", type=float, default=0.0,
-                    help="timeout absoluto por arquivo (0=desligado, default)")
+                    help="absolute timeout per file (0=disabled, default)")
     ap.add_argument("--scan-timeout", type=float, default=30.0,
-                    help="timeout para listar UM diretorio (default 30s). "
-                         "Diretorios em area defeituosa que travam o scandir "
-                         "sao abandonados e marcados no err-log.")
+                    help="timeout for listing ONE directory (default 30s). "
+                         "Directories in damaged areas that hang scandir "
+                         "are abandoned and recorded in the err-log.")
     ap.add_argument("--status-file", default="/tmp/skip_copy.status",
-                    help="arquivo onde a operacao atual e gravada (sobrescrito "
-                         "a cada passo). Default: /tmp/skip_copy.status (tmpfs, "
-                         "em RAM, nao desgasta SSD). Use '' para desligar. "
-                         "Para inspecionar em outro terminal: cat <status-file>")
+                    help="file where the current operation is written (overwritten "
+                         "at every step). Default: /tmp/skip_copy.status (tmpfs, "
+                         "in RAM, does not wear out the SSD). Use '' to disable. "
+                         "To inspect from another terminal: cat <status-file>")
     ap.add_argument("--chunk", type=int, default=1024 * 1024,
-                    help="tamanho do bloco de leitura (default 1MiB)")
+                    help="read block size (default 1MiB)")
     ap.add_argument("--poll", type=float, default=1.0,
-                    help="intervalo de monitoramento em segundos (default 1)")
+                    help="monitoring interval in seconds (default 1)")
     ap.add_argument("--no-preserve", action="store_true",
-                    help="nao preservar mode/timestamps")
+                    help="do not preserve mode/timestamps")
     ap.add_argument("--check-size", action="store_true",
-                    help="ao re-rodar, verifica tamanho do destino antes de "
-                         "pular (mais seguro porem faz stat na origem)")
+                    help="on re-runs, check the destination size before "
+                         "skipping (safer, but stats the source)")
     ap.add_argument("--progress-pct", type=float, default=1.0,
-                    help="se --prescan estiver ligado, imprime linha de "
-                         "progresso a cada N%% dos arquivos (default 1)")
+                    help="if --prescan is enabled, print a progress "
+                         "line every N%% of the files (default 1)")
     ap.add_argument("--prescan", action="store_true",
-                    help="pre-varre para contar arquivos (habilita %% e ETA)")
+                    help="pre-scan to count files (enables %% and ETA)")
     ap.add_argument("--dry-run", action="store_true",
-                    help="apenas lista o que faria")
+                    help="only list what would be done")
     args = ap.parse_args()
 
     src_root = os.path.abspath(args.src.rstrip("/") or "/")
     dst_root = os.path.abspath(args.dst.rstrip("/") or "/")
 
     if not os.path.isdir(src_root):
-        print(f"erro: origem nao e diretorio: {src_root}", file=sys.stderr)
+        print(f"error: source is not a directory: {src_root}", file=sys.stderr)
         return 2
     if not args.dry_run:
         os.makedirs(dst_root, exist_ok=True)
@@ -679,13 +679,13 @@ def main() -> int:
     checkpoint = set() if args.no_checkpoint else load_path_set(args.checkpoint_log)
     accept_loss = AcceptLoss(load_path_set(args.accept_loss) if args.accept_loss else set())
     if done:
-        print(f"done-log:       {len(done)} arquivos previamente OK")
+        print(f"done-log:       {len(done)} files previously OK")
     if failed:
-        print(f"err-log:        {len(failed)} previamente com falha (--skip-failed)")
+        print(f"err-log:        {len(failed)} previously failed (--skip-failed)")
     if checkpoint:
-        print(f"checkpoint-log: {len(checkpoint)} diretorios 100%% concluidos")
+        print(f"checkpoint-log: {len(checkpoint)} directories 100% complete")
     if accept_loss:
-        print(f"accept-loss:    {len(accept_loss)} caminhos com perda aceita")
+        print(f"accept-loss:    {len(accept_loss)} paths with accepted loss")
 
     _install_sigint()
 
@@ -702,8 +702,8 @@ def main() -> int:
         err_log = open(args.log, "a", buffering=1)
         done_log = open(args.done_log, "a", buffering=1)
         ckpt_log = open(args.checkpoint_log, "a", buffering=1)
-        hdr = (f"# skip_copy iniciado em {started.isoformat(timespec='seconds')}\n"
-               f"# origem={src_root} destino={dst_root} "
+        hdr = (f"# skip_copy started at {started.isoformat(timespec='seconds')}\n"
+               f"# source={src_root} destination={dst_root} "
                f"stall={args.stall}s timeout={args.timeout}s "
                f"skip_failed={args.skip_failed} no_checkpoint={args.no_checkpoint}\n")
         err_log.write(hdr)
@@ -713,13 +713,13 @@ def main() -> int:
     ctx = WalkContext(args, src_root, dst_root, done, failed, checkpoint,
                       accept_loss, err_log, done_log, ckpt_log, status)
 
-    # prescan opcional
+    # optional prescan
     if args.prescan and args.progress_pct > 0:
-        print("[prescan] enumerando arquivos...", flush=True)
+        print("[prescan] enumerating files...", flush=True)
         t0 = time.monotonic()
         ctx.total_planned = _prescan(src_root, checkpoint, args.no_checkpoint,
                                       args.scan_timeout, status, accept_loss)
-        print(f"[prescan] {ctx.total_planned} arquivos em "
+        print(f"[prescan] {ctx.total_planned} files in "
               f"{time.monotonic() - t0:.1f}s", flush=True)
         if ctx.total_planned > 0 and args.progress_pct > 0:
             ctx.progress_step = max(1, int(ctx.total_planned * args.progress_pct / 100.0))
@@ -735,19 +735,19 @@ def main() -> int:
         sys.stdout.write("\n")
         summary = (f"total={ctx.total} ok={ctx.ok} "
                    f"(done-log={ctx.skipped_done}, "
-                   f"mesmo-tamanho={ctx.skipped_size}, "
+                   f"same-size={ctx.skipped_size}, "
                    f"ckpt-dirs={ctx.skipped_ckpt_dirs}, "
                    f"accept-loss={ctx.skipped_accept}) "
-                   f"falhas={ctx.fail} (skip-failed={ctx.skipped_fail})")
+                   f"failures={ctx.fail} (skip-failed={ctx.skipped_fail})")
         if err_log:
-            tail = (f"# skip_copy terminado em "
+            tail = (f"# skip_copy finished at "
                     f"{ended.isoformat(timespec='seconds')}  {summary}\n")
             err_log.write(tail); err_log.close()
             done_log.write(tail); done_log.close()
             ckpt_log.write(tail); ckpt_log.close()
         print(summary)
-        print(f"Falhas:      {args.log}")
-        print(f"Sucessos:    {args.done_log}")
+        print(f"Failures:    {args.log}")
+        print(f"Successes:   {args.done_log}")
         print(f"Checkpoint:  {args.checkpoint_log}")
 
     return 0 if ctx.fail == 0 else 1

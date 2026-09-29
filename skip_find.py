@@ -1,53 +1,53 @@
 #!/usr/bin/env python3
 """
-skip_find.py - localiza arquivos mais novos que uma data/hora dada,
-em midia com defeito (CRC ruim) que pode travar syscalls do kernel.
+skip_find.py - find files newer than a given date/time on damaged
+media (bad CRC) that can hang kernel syscalls.
 
-Equivalente funcional a:
+Functionally equivalent to:
     find <path> -newermt "2026-04-12" -type f
-mas robusto a travamentos de kernel em areas defeituosas do disco
-e INCREMENTAL (pode rodar varias vezes, pula o que ja varreu).
+but resilient to kernel hangs in defective areas of the disk, and
+INCREMENTAL (can be run many times; skips what was already scanned).
 
-Logs (caminhos absolutos; compartilhaveis entre execucoes):
-- --list-log        ENCONTRADOS:    <abs_path>  (mtime >= threshold)
-- --err-log         FALHAS:         <abs_path>\t# <motivo>
-- --done-log        PROCESSADOS OK: <abs_path>  (todos os arquivos onde
-                    o stat funcionou, independente do mtime)
-- --checkpoint-log  DIRETORIOS OK:  <abs_dir_path> (subarvore 100%%
-                    processada sem falhas -- sera pulada inteira na
-                    proxima execucao)
+Logs (absolute paths; can be shared across runs):
+- --list-log        FOUND:          <abs_path>  (mtime >= threshold)
+- --err-log         FAILURES:       <abs_path>\t# <reason>
+- --done-log        PROCESSED OK:   <abs_path>  (every file whose stat
+                    succeeded, regardless of mtime)
+- --checkpoint-log  DIRECTORIES OK: <abs_dir_path> (subtree 100%
+                    processed without failures -- skipped entirely on
+                    the next run)
 
-Legenda do progresso (stdout):
-    .   arquivo encontrado (mtime >= threshold)
-    _   arquivo mais antigo (mtime < threshold)
-    :   pulado pelo done-log (ja processado em rodada anterior)
-    D   subarvore inteira pulada por checkpoint
-    x   pulado pelo err-log (--skip-failed)
-    X   falha nesta rodada (foi pro err-log)
+Progress legend (stdout):
+    .   file found (mtime >= threshold)
+    _   older file (mtime < threshold)
+    :   skipped via done-log (already processed in a previous run)
+    D   whole subtree skipped via checkpoint
+    x   skipped via err-log (--skip-failed)
+    X   failure in this run (written to err-log)
 
-Estrategia para midia ruim (mesma do skip_copy.py):
-- Enumeracao (scandir) em subprocesso com timeout (--scan-timeout).
-  Se o diretorio travar no kernel, o filho e abandonado/morto e a
-  varredura continua nos demais diretorios.
-- stat() de cada arquivo tambem e feito dentro do subprocesso do scandir
-  (batch por diretorio). Se o stat travar, o timeout do diretorio dispara.
-- Para arquivos em diretorios onde o scandir+stat funcionou mas com
-  stat individual falhando, um fallback com stat em processo separado
-  com --stat-timeout pode ser usado.
-- Status file (--status-file, default /tmp/skip_find.status em tmpfs):
-  mostra onde o script esta agora. Em caso de travamento total:
-  'cat /tmp/skip_find.status' para descobrir.
+Strategy for bad media (same as skip_copy.py):
+- Enumeration (scandir) runs in a subprocess with a timeout
+  (--scan-timeout). If the directory hangs in the kernel, the child is
+  abandoned/killed and the scan continues with the other directories.
+- stat() of each file is also done inside the scandir subprocess
+  (batched per directory). If stat hangs, the directory timeout fires.
+- For files in directories where scandir+stat worked but an individual
+  stat failed, a fallback stat in a separate process with
+  --stat-timeout is used.
+- Status file (--status-file, default /tmp/skip_find.status on tmpfs):
+  shows where the script is right now. If everything hangs, run
+  'cat /tmp/skip_find.status' to find out.
 
-Uso incremental:
-- Rode em subdiretorios prioritarios primeiro, depois em diretorios
-  mais amplos -- os logs sao compartilhados e o que ja foi varrido
-  e automaticamente pulado (done-log e checkpoint).
-- O --list-log SEMPRE faz append (nunca perde resultado anterior).
-- Para forcar re-varredura, use --no-checkpoint e/ou apague o done-log.
+Incremental use:
+- Run on priority subdirectories first, then on broader directories --
+  the logs are shared and whatever was already scanned is skipped
+  automatically (done-log and checkpoint).
+- --list-log ALWAYS appends (previous results are never lost).
+- To force a rescan, use --no-checkpoint and/or delete the done-log.
 
 Ctrl+C:
-- 1x  -> pula o diretorio/operacao atual e segue.
-- 2x rapido (<2s) -> sai do programa.
+- once  -> skip the current directory/operation and continue.
+- twice quickly (<2s) -> exit the program.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ from datetime import datetime
 
 
 # ---------------------------------------------------------------------------
-# estado global para sinais
+# global state for signal handling
 # ---------------------------------------------------------------------------
 
 class _Ctrl:
@@ -82,22 +82,22 @@ def _install_sigint() -> None:
             CTRL.int_count = 1
         CTRL.last_int = now
         if CTRL.int_count >= 2:
-            sys.stderr.write("\n[interrupt] segundo Ctrl+C, saindo HARD.\n")
+            sys.stderr.write("\n[interrupt] second Ctrl+C, exiting HARD.\n")
             os._exit(130)
         sys.stderr.write(
-            "\n[interrupt] pulando operacao atual "
-            "(Ctrl+C de novo em <2s para sair).\n")
+            "\n[interrupt] skipping current operation "
+            "(Ctrl+C again within 2s to exit).\n")
         CTRL.abort_current = True
     signal.signal(signal.SIGINT, handler)
 
 
 # ---------------------------------------------------------------------------
-# kill nao-bloqueante (processo filho preso em D-state)
+# non-blocking kill (child process stuck in D-state)
 # ---------------------------------------------------------------------------
 
 def _kill_nb(p: mp.Process) -> None:
-    """Mata o filho sem bloquear. Se estiver em D-state no kernel, o kill
-    nao fara nada -- entao NAO esperamos indefinidamente."""
+    """Kill the child without blocking. If it is in D-state in the kernel,
+    the kill will do nothing -- so we do NOT wait indefinitely."""
     try:
         if p.is_alive():
             p.terminate()
@@ -119,13 +119,13 @@ def _kill_nb(p: mp.Process) -> None:
 
 
 # ---------------------------------------------------------------------------
-# scandir + stat em subprocesso com timeout
+# scandir + stat in a subprocess with timeout
 # ---------------------------------------------------------------------------
 
 def _scan_stat_worker(d: str, q) -> None:
-    """Filho: lista diretorio com scandir e faz stat em cada arquivo.
-    Retorna lista de (name, kind, mtime_ns) via queue.
-    mtime_ns = -1 se stat falhou para aquele arquivo."""
+    """Child: list the directory with scandir and stat each file.
+    Returns a list of (name, kind, mtime_ns) via the queue.
+    mtime_ns = -1 if stat failed for that file."""
     signal.signal(signal.SIGTERM, lambda *_: os._exit(2))
     signal.signal(signal.SIGINT, lambda *_: os._exit(2))
     try:
@@ -152,7 +152,7 @@ def _scan_stat_worker(d: str, q) -> None:
                     result.append((e.name, kind, -1))
                     continue
 
-                # stat para obter mtime
+                # stat to get mtime
                 try:
                     st = e.stat(follow_symlinks=False)
                     mtime_ns = st.st_mtime_ns
@@ -168,8 +168,8 @@ def _scan_stat_worker(d: str, q) -> None:
 
 
 def safe_scandir_stat(d: str, timeout: float):
-    """Lista entradas de `d` com stat num subprocesso.
-    Retorna (entries, error) onde entries = [(name, kind, mtime_ns), ...] ou None."""
+    """List entries of `d` with stat in a subprocess.
+    Returns (entries, error) where entries = [(name, kind, mtime_ns), ...] or None."""
     ctx = mp.get_context("fork")
     q = ctx.Queue()
     p = ctx.Process(target=_scan_stat_worker, args=(d, q))
@@ -189,7 +189,7 @@ def safe_scandir_stat(d: str, timeout: float):
 
 
 # ---------------------------------------------------------------------------
-# stat individual em subprocesso (fallback para arquivos com stat falhado)
+# individual stat in a subprocess (fallback for files whose stat failed)
 # ---------------------------------------------------------------------------
 
 def _stat_worker(path: str, q) -> None:
@@ -205,7 +205,7 @@ def _stat_worker(path: str, q) -> None:
 
 
 def safe_stat_mtime(path: str, timeout: float):
-    """Faz stat num subprocesso. Retorna (mtime_ns, error)."""
+    """Run stat in a subprocess. Returns (mtime_ns, error)."""
     ctx = mp.get_context("fork")
     q = ctx.Queue()
     p = ctx.Process(target=_stat_worker, args=(path, q))
@@ -267,17 +267,17 @@ def load_path_set(path: str) -> set:
                 if p:
                     s.add(p)
     except OSError as e:
-        print(f"aviso: nao consegui ler {path}: {e}", file=sys.stderr)
+        print(f"warning: could not read {path}: {e}", file=sys.stderr)
     return s
 
 
 # ---------------------------------------------------------------------------
-# parse de data/hora
+# date/time parsing
 # ---------------------------------------------------------------------------
 
 def parse_newermt(s: str) -> float:
-    """Converte string de data ou data+hora para timestamp (epoch seconds).
-    Aceita formatos: YYYY-MM-DD, YYYY-MM-DD HH:MM, YYYY-MM-DD HH:MM:SS"""
+    """Convert a date or date+time string to a timestamp (epoch seconds).
+    Accepted formats: YYYY-MM-DD, YYYY-MM-DD HH:MM, YYYY-MM-DD HH:MM:SS"""
     s = s.strip().strip('"').strip("'")
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
@@ -286,12 +286,12 @@ def parse_newermt(s: str) -> float:
         except ValueError:
             continue
     raise ValueError(
-        f"formato de data invalido: '{s}'. "
-        f"Use YYYY-MM-DD ou 'YYYY-MM-DD HH:MM:SS'")
+        f"invalid date format: '{s}'. "
+        f"Use YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'")
 
 
 # ---------------------------------------------------------------------------
-# walk recursivo com checkpoint por diretorio
+# recursive walk with per-directory checkpoint
 # ---------------------------------------------------------------------------
 
 class FindContext:
@@ -302,15 +302,15 @@ class FindContext:
         self.src_root = src_root
         self.threshold_ns = threshold_ns  # nanoseconds
         self.skip_dirs = skip_dirs
-        self.done = done            # set de caminhos absolutos ja processados
-        self.failed = failed        # set de caminhos com falha anterior
-        self.checkpoint = checkpoint  # set de diretorios 100% OK
+        self.done = done            # set of absolute paths already processed
+        self.failed = failed        # set of paths that failed previously
+        self.checkpoint = checkpoint  # set of directories that are 100% OK
         self.list_log = list_log
         self.err_log = err_log
         self.done_log = done_log
         self.ckpt_log = ckpt_log
         self.status = status
-        # contadores
+        # counters
         self.dirs_scanned = 0
         self.dirs_failed = 0
         self.dirs_skipped = 0
@@ -320,13 +320,13 @@ class FindContext:
         self.files_stat_failed = 0
         self.skipped_done = 0
         self.skipped_fail = 0
-        # progresso
+        # progress
         self.progress_t0 = time.monotonic()
         self.last_report = time.monotonic()
 
 
 def _covers_skip(path: str, skip_dirs: set) -> bool:
-    """True se path ou algum ancestral esta em skip_dirs."""
+    """True if path or any of its ancestors is in skip_dirs."""
     if not skip_dirs:
         return False
     p = path.rstrip("/") or "/"
@@ -358,41 +358,42 @@ def _print_status(ctx: FindContext, force: bool = False) -> None:
 
 
 def _process_file(full: str, ctx: FindContext) -> bool:
-    """Processa um arquivo. Retorna True se OK (para checkpoint do pai),
-    False se houve falha que impede checkpoint."""
+    """Process a file. Returns True if OK (for the parent's checkpoint),
+    False if there was a failure that prevents the checkpoint, or None
+    if the file still needs a stat."""
     args = ctx.args
 
-    # 1) ja em done-log: pula
+    # 1) already in done-log: skip
     if full in ctx.done:
         ctx.skipped_done += 1
         sys.stdout.write(":"); sys.stdout.flush()
         return True
 
-    # 2) ja em err-log e --skip-failed: pula
+    # 2) already in err-log and --skip-failed: skip
     if args.skip_failed and full in ctx.failed:
         ctx.skipped_fail += 1
         sys.stdout.write("x"); sys.stdout.flush()
-        return False  # falha anterior impede checkpoint
+        return False  # previous failure prevents checkpoint
 
-    return None  # precisa stat
+    return None  # needs stat
 
 
 def _process_dir(d: str, ctx: FindContext) -> bool:
-    """Processa um diretorio recursivamente. Retorna True se a subarvore
-    inteira foi 100% processada OK -- nesse caso grava no checkpoint."""
+    """Process a directory recursively. Returns True if the whole subtree
+    was 100% processed OK -- in that case it is written to the checkpoint."""
     args = ctx.args
 
     if CTRL.abort_current:
         CTRL.abort_current = False
         return False
 
-    # checkpoint: subarvore ja marcada como completa
+    # checkpoint: subtree already marked as complete
     if not args.no_checkpoint and d in ctx.checkpoint:
         ctx.skipped_ckpt_dirs += 1
         sys.stdout.write("D"); sys.stdout.flush()
         return True
 
-    # skip-dir: subarvore inteira pulada (nao conta como checkpoint)
+    # skip-dir: whole subtree skipped (does not count as checkpoint)
     if _covers_skip(d, ctx.skip_dirs):
         ctx.dirs_skipped += 1
         sys.stdout.write("D"); sys.stdout.flush()
@@ -446,7 +447,7 @@ def _process_dir(d: str, ctx: FindContext) -> bool:
 
         # need stat -- check mtime_ns from batch
         if mtime_ns == -1:
-            # stat falhou no batch, tenta stat individual
+            # stat failed in the batch, try an individual stat
             if ctx.status:
                 ctx.status.set("file:stat", full)
             mtime_ns_retry, stat_err = safe_stat_mtime(full, args.stat_timeout)
@@ -483,7 +484,7 @@ def _process_dir(d: str, ctx: FindContext) -> bool:
         if not sub_ok:
             all_good = False
 
-    # checkpoint: se tudo OK e nao esta no modo no-checkpoint
+    # checkpoint: if everything is OK and not in no-checkpoint mode
     if all_good and not args.no_checkpoint:
         ctx.ckpt_log.write(d + "\n")
         ctx.ckpt_log.flush()
@@ -497,62 +498,63 @@ def _process_dir(d: str, ctx: FindContext) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Localiza arquivos mais novos que uma data em midia "
-                    "com defeito (CRC), sem travar em syscalls. "
-                    "Incremental: rode varias vezes, pula o que ja varreu.")
-    ap.add_argument("src", help="diretorio raiz da busca")
+        description="Find files newer than a date on damaged media "
+                    "(CRC errors) without hanging on syscalls. "
+                    "Incremental: run it many times; it skips what was "
+                    "already scanned.")
+    ap.add_argument("src", help="root directory of the search")
     ap.add_argument("--newermt", required=True,
-                    help="threshold de data/hora. Formatos: "
-                         "'YYYY-MM-DD' ou 'YYYY-MM-DD HH:MM:SS'. "
-                         "Arquivos com mtime >= este valor sao listados.")
+                    help="date/time threshold. Formats: "
+                         "'YYYY-MM-DD' or 'YYYY-MM-DD HH:MM:SS'. "
+                         "Files with mtime >= this value are listed.")
     ap.add_argument("--list-log", default="/root/skip_find.list.log",
-                    help="saida: lista de arquivos encontrados (append, "
+                    help="output: list of files found (append, "
                          "default: /root/skip_find.list.log)")
     ap.add_argument("--err-log", default="/root/skip_find.err.log",
-                    help="saida: erros/timeouts (append, "
+                    help="output: errors/timeouts (append, "
                          "default: /root/skip_find.err.log)")
     ap.add_argument("--done-log", default="/root/skip_find.done.log",
-                    help="log de arquivos ja processados (stat OK). "
-                         "Na proxima execucao esses sao pulados. "
+                    help="log of files already processed (stat OK). "
+                         "They are skipped on the next run. "
                          "(default: /root/skip_find.done.log)")
     ap.add_argument("--checkpoint-log", default="/root/skip_find.dirs.log",
-                    help="log de diretorios 100%% processados. "
-                         "Na proxima execucao sao pulados inteiros. "
+                    help="log of 100%% processed directories. "
+                         "They are skipped entirely on the next run. "
                          "(default: /root/skip_find.dirs.log)")
     ap.add_argument("--no-checkpoint", action="store_true",
-                    help="desliga o checkpoint por diretorio "
-                         "(re-visita toda a arvore)")
+                    help="disable the per-directory checkpoint "
+                         "(revisits the whole tree)")
     ap.add_argument("--skip-failed", action="store_true",
-                    help="pula arquivos que ja estao no err-log "
-                         "(nao re-tenta areas danificadas)")
+                    help="skip files that are already in the err-log "
+                         "(does not retry damaged areas)")
     ap.add_argument("--skip-dir", default="",
-                    help="arquivo com caminhos absolutos de diretorios a "
-                         "pular inteiros (um por linha). Use '' para desligar.")
+                    help="file with absolute paths of directories to skip "
+                         "entirely (one per line). Use '' to disable.")
     ap.add_argument("--scan-timeout", type=float, default=30.0,
-                    help="timeout para scandir+stat de UM diretorio "
+                    help="timeout for scandir+stat of ONE directory "
                          "(default 30s)")
     ap.add_argument("--stat-timeout", type=float, default=10.0,
-                    help="timeout para stat individual de UM arquivo "
-                         "(fallback quando o stat no batch falha, default 10s)")
+                    help="timeout for the individual stat of ONE file "
+                         "(fallback when the batch stat fails, default 10s)")
     ap.add_argument("--status-file", default="/tmp/skip_find.status",
-                    help="arquivo de status (default: /tmp/skip_find.status). "
-                         "Use '' para desligar.")
+                    help="status file (default: /tmp/skip_find.status). "
+                         "Use '' to disable.")
     ap.add_argument("--verbose", action="store_true",
-                    help="mostra '_' para cada arquivo mais antigo que o "
-                         "threshold (default: silencioso)")
+                    help="show '_' for each file older than the "
+                         "threshold (default: silent)")
     args = ap.parse_args()
 
     # parse threshold
     try:
         threshold = parse_newermt(args.newermt)
     except ValueError as e:
-        print(f"erro: {e}", file=sys.stderr)
+        print(f"error: {e}", file=sys.stderr)
         return 2
     threshold_ns = int(threshold * 1_000_000_000)
 
     src_root = os.path.abspath(args.src.rstrip("/") or "/")
     if not os.path.isdir(src_root):
-        print(f"erro: nao e diretorio: {src_root}", file=sys.stderr)
+        print(f"error: not a directory: {src_root}", file=sys.stderr)
         return 2
 
     # skip-dirs (manual)
@@ -564,17 +566,17 @@ def main() -> int:
         if d != ".":
             os.makedirs(d, exist_ok=True)
 
-    # carregar logs anteriores
+    # load previous logs
     done = load_path_set(args.done_log)
     failed = load_path_set(args.err_log) if args.skip_failed else set()
     checkpoint = set() if args.no_checkpoint else load_path_set(args.checkpoint_log)
 
     if done:
-        print(f"done-log:       {len(done)} arquivos previamente processados")
+        print(f"done-log:       {len(done)} files previously processed")
     if failed:
-        print(f"err-log:        {len(failed)} previamente com falha (--skip-failed)")
+        print(f"err-log:        {len(failed)} previously failed (--skip-failed)")
     if checkpoint:
-        print(f"checkpoint-log: {len(checkpoint)} diretorios 100%% concluidos")
+        print(f"checkpoint-log: {len(checkpoint)} directories 100% complete")
 
     _install_sigint()
 
@@ -585,14 +587,14 @@ def main() -> int:
         status.set("start", src_root)
         print(f"status-file: {args.status_file}")
 
-    # todos os logs em append
+    # all logs in append mode
     list_log = open(args.list_log, "a", buffering=1)
     err_log = open(args.err_log, "a", buffering=1)
     done_log = open(args.done_log, "a", buffering=1)
     ckpt_log = open(args.checkpoint_log, "a", buffering=1)
 
-    hdr = (f"# skip_find iniciado em {started.isoformat(timespec='seconds')}\n"
-           f"# raiz={src_root} newermt={args.newermt} "
+    hdr = (f"# skip_find started at {started.isoformat(timespec='seconds')}\n"
+           f"# root={src_root} newermt={args.newermt} "
            f"(threshold={datetime.fromtimestamp(threshold).isoformat()}) "
            f"scan-timeout={args.scan_timeout}s stat-timeout={args.stat_timeout}s "
            f"skip_failed={args.skip_failed} no_checkpoint={args.no_checkpoint}\n")
@@ -601,7 +603,7 @@ def main() -> int:
     done_log.write(hdr)
     ckpt_log.write(hdr)
 
-    print(f"raiz:      {src_root}")
+    print(f"root:      {src_root}")
     print(f"newermt:   {args.newermt} "
           f"(>= {datetime.fromtimestamp(threshold).isoformat()})")
     print(f"list-log:  {args.list_log}")
@@ -609,7 +611,7 @@ def main() -> int:
     print(f"done-log:  {args.done_log}")
     print(f"checkpoint:{args.checkpoint_log}")
     if skip_dirs:
-        print(f"skip-dirs: {len(skip_dirs)} diretorios a pular")
+        print(f"skip-dirs: {len(skip_dirs)} directories to skip")
     print(flush=True)
 
     ctx = FindContext(args, src_root, threshold_ns, skip_dirs,
@@ -634,21 +636,21 @@ def main() -> int:
                    f"skip(done={ctx.skipped_done},fail={ctx.skipped_fail}) "
                    f"stat_failed={ctx.files_stat_failed} "
                    f"elapsed={elapsed:.1f}s")
-        tail = (f"# skip_find terminado em "
+        tail = (f"# skip_find finished at "
                 f"{ended.isoformat(timespec='seconds')}  {summary}\n")
         list_log.write(tail); list_log.close()
         err_log.write(tail); err_log.close()
         done_log.write(tail); done_log.close()
         ckpt_log.write(tail); ckpt_log.close()
         print(summary)
-        print(f"Encontrados: {args.list_log} ({ctx.files_found} novos nesta rodada)")
-        print(f"Processados: {args.done_log}")
+        print(f"Found:       {args.list_log} ({ctx.files_found} new in this run)")
+        print(f"Processed:   {args.done_log}")
         print(f"Checkpoint:  {args.checkpoint_log}")
-        print(f"Erros:       {args.err_log}")
+        print(f"Errors:      {args.err_log}")
 
     return 0 if ctx.dirs_failed == 0 and ctx.files_stat_failed == 0 else 1
 
 
 if __name__ == "__main__":
     rc = main()
-    os._exit(rc)  # hard exit: evita hang no atexit do multiprocessing
+    os._exit(rc)  # hard exit: avoids a hang in multiprocessing atexit
